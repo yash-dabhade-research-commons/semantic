@@ -5,7 +5,6 @@ import os
 import argparse
 import logging
 from tqdm import tqdm
-from datetime import datetime
 
 class SemanticScholarBulkSearch:
     BASE_URL = "https://api.semanticscholar.org/graph/v1"
@@ -121,10 +120,10 @@ class SemanticScholarBulkSearch:
         # If we've exhausted retries
         self.logger.error(f"Failed after {max_retries} retries. Waiting 24 hours before continuing...")
         
-        # Sleep for 24 hours
-        hours_24 = 24 * 60 * 60
-        self.logger.info(f"Sleeping for 24 hours until {datetime.now() + datetime.timedelta(seconds=hours_24)}")
-        time.sleep(hours_24)
+        # Sleep for 30 minutes
+        minutes_30 = 30 * 60
+        self.logger.info(f"Sleeping for 30 minutes!!")
+        time.sleep(minutes_30)
         
         # Try one more time after 24 hours
         self._respect_rate_limit()
@@ -137,6 +136,7 @@ class SemanticScholarBulkSearch:
                       open_access_pdf=False, min_citation_count=None, 
                       publication_date_or_year=None, year=None, venue=None, 
                       fields_of_study=None, max_papers=None, resume_token=None,
+                      page_offset=0,
                       output_file="search_results.json"):
         """
         Search for papers using the bulk search API with resumption support.
@@ -154,6 +154,7 @@ class SemanticScholarBulkSearch:
             fields_of_study (list): List of fields of study to filter by
             max_papers (int): Maximum number of papers to retrieve (None for all)
             resume_token (str): Token to resume search from
+            page_offset (int): Page offset for pagination
             output_file (str): Filename to save results incrementally
             
         Returns:
@@ -163,7 +164,7 @@ class SemanticScholarBulkSearch:
         
         # Build query parameters
         # If no query is provided, use "*" as a wildcard to match everything
-        params = {"query": query if query else "*"}
+        params = {"query": query if query else "*", "offset": page_offset}
         
         if fields:
             params["fields"] = ",".join(fields)
@@ -195,6 +196,7 @@ class SemanticScholarBulkSearch:
         # Initialize results
         all_papers = []
         continuation_token = resume_token
+        current_page_offset = page_offset
         pbar = None
         output_path = os.path.join(self.output_dir, output_file)
         
@@ -203,7 +205,7 @@ class SemanticScholarBulkSearch:
             try:
                 with open(output_path, 'r', encoding='utf-8') as f:
                     all_papers = json.load(f)
-                    self.logger.info(f"Resuming search with {len(all_papers)} papers already collected")
+                    self.logger.info(f"Resuming search with {len(all_papers)} papers already collected at page offset {current_page_offset}")
             except json.JSONDecodeError:
                 self.logger.warning(f"Could not load existing data from {output_path}. Starting fresh.")
                 all_papers = []
@@ -215,7 +217,10 @@ class SemanticScholarBulkSearch:
             # Add continuation token if we have one
             if continuation_token:
                 params["token"] = continuation_token
-                self.logger.info(f"Using continuation token: {continuation_token}")
+                self.logger.info(f"Using continuation token: {continuation_token} with page offset: {current_page_offset}")
+            else:
+                params["offset"] = current_page_offset
+                self.logger.info(f"Using page offset: {current_page_offset}")
             
             self.logger.info(f"Fetching batch {batch_count} of papers...")
             
@@ -238,29 +243,35 @@ class SemanticScholarBulkSearch:
             
             # Add papers to our results
             papers = result["data"]
-            all_papers.extend(papers)
-            papers_fetched = len(all_papers)
-            pbar.update(len(papers))
-            
-            self.logger.info(f"Fetched {len(papers)} papers in this batch. Total: {papers_fetched} papers")
-            
-            # Incrementally save results after each batch
-            self.save_results(all_papers, output_file, append=False)
-            self.logger.info(f"Saved {papers_fetched} papers to {output_path}")
+            if len(papers) > 0:
+                all_papers.extend(papers)
+                papers_fetched = len(all_papers)
+                pbar.update(len(papers))
+                
+                self.logger.info(f"Fetched {len(papers)} papers in this batch. Total: {papers_fetched} papers")
+                
+                # Increment page offset for next request
+                current_page_offset += len(papers)
+                
+                # Incrementally save results after each batch
+                self.save_results(all_papers, output_file, append=False)
+                self.logger.info(f"Saved {papers_fetched} papers to {output_path}")
+            else:
+                self.logger.info("No papers in this batch. Might have reached the end of results.")
             
             # Check if we need to continue
             continuation_token = result.get("token")
             
-            # Log the continuation token for resumption capability
+            # Log the continuation token and page offset for resumption capability
             if continuation_token:
-                self.logger.info(f"Next continuation token: {continuation_token}")
+                self.logger.info(f"Next continuation token: {continuation_token}, page offset: {current_page_offset}")
                 
-                # Save token to a file for resumption
+                # Save token and page offset to a file for resumption
                 token_file = os.path.join(self.output_dir, "continuation_token.txt")
                 with open(token_file, 'w') as f:
-                    f.write(continuation_token)
+                    f.write(f"{continuation_token}\n{current_page_offset}")
                 
-                self.logger.info(f"Saved continuation token to {token_file}")
+                self.logger.info(f"Saved continuation token and page offset to {token_file}")
             else:
                 self.logger.info("No more continuation tokens. Search is complete.")
             
@@ -319,15 +330,18 @@ class SemanticScholarBulkSearch:
             return backup_path
 
 def load_continuation_token(output_dir):
-    """Load continuation token from file if it exists."""
+    """Load continuation token and page offset from file if it exists."""
     token_file = os.path.join(output_dir, "continuation_token.txt")
     if os.path.exists(token_file):
         try:
             with open(token_file, 'r') as f:
-                return f.read().strip()
+                lines = f.read().strip().split('\n')
+                token = lines[0] if lines else None
+                page_offset = int(lines[1]) if len(lines) > 1 else 0
+                return token, page_offset
         except IOError:
-            return None
-    return None
+            return None, 0
+    return None, 0
 
 def main():
     parser = argparse.ArgumentParser(description="Search for papers using Semantic Scholar bulk search API")
@@ -361,10 +375,11 @@ def main():
     
     # Check if we should resume
     resume_token = None
+    page_offset = 0
     if args.resume:
-        resume_token = load_continuation_token(args.output_dir)
+        resume_token, page_offset = load_continuation_token(args.output_dir)
         if resume_token:
-            searcher.logger.info(f"Resuming search with token: {resume_token}")
+            searcher.logger.info(f"Resuming search with token: {resume_token}, page offset: {page_offset}")
         else:
             searcher.logger.info("No continuation token found. Starting a new search.")
     
@@ -382,6 +397,7 @@ def main():
         fields_of_study=fields_of_study,
         max_papers=args.max_papers,
         resume_token=resume_token,
+        page_offset=page_offset,
         output_file=args.output
     )
     
