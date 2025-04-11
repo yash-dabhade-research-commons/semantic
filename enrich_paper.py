@@ -429,10 +429,10 @@ def enrich_from_unpaywall(doi):
 # --- Main Execution Logic ---
 def main():
     parser = argparse.ArgumentParser(description="Enrich Elasticsearch paper data.")
-    parser.add_argument("--host", default="35.193.245.34", help="Elasticsearch host.")
+    parser.add_argument("--host", help="Elasticsearch host.")
     parser.add_argument("--port", type=int, default=9200, help="Elasticsearch port.")
     parser.add_argument("--user", default="elastic", help="Elasticsearch user.")
-    parser.add_argument("--password", default="UIm79Shaaaii982", help="Elasticsearch password.")
+    parser.add_argument("--password", help="Elasticsearch password.")
     parser.add_argument("--index", default="semantic_scholar_papers", help="Elasticsearch index name.")
     parser.add_argument("--min-citation", type=int, required=True, help="Minimum citation count.")
     parser.add_argument("--max-citation", type=int, required=True, help="Maximum citation count.")
