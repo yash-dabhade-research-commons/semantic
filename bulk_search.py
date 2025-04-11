@@ -61,6 +61,18 @@ class SemanticScholarBulkSearch:
         
         self.last_request_time = time.time()
     
+    def check_internet_connection(self, timeout=5):
+        """
+        Check if there is an active internet connection.
+        Returns True if connected, False otherwise.
+        """
+        try:
+            # Try connecting to a reliable server with a short timeout
+            requests.get("https://www.google.com", timeout=timeout)
+            return True
+        except requests.exceptions.RequestException:
+            return False
+    
     def make_request_with_retry(self, method, url, **kwargs):
         """
         Make an HTTP request with retry logic for handling errors.
@@ -75,8 +87,20 @@ class SemanticScholarBulkSearch:
         """
         max_retries = 10
         retry_count = 0
+        infinite_network_retries = True  # Set to True to keep retrying network errors indefinitely
+        max_wait_time = 300  # Maximum wait time between retries (5 minutes)
         
-        while retry_count < max_retries:
+        while True:
+            # If we have network issues, check for internet connectivity
+            if retry_count > 3:
+                if not self.check_internet_connection():
+                    self.logger.warning("No internet connection detected. Waiting for connectivity...")
+                    # Wait for a longer time when no internet connection
+                    wait_time = min(30 * (retry_count - 2), max_wait_time)
+                    self.logger.info(f"Will retry in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+            
             try:
                 self._respect_rate_limit()
                 
@@ -112,25 +136,68 @@ class SemanticScholarBulkSearch:
                     continue
             
             except requests.exceptions.RequestException as e:
-                self.logger.error(f"Request error: {str(e)}")
-                retry_count += 1
-                self.logger.info(f"Retrying in 10 seconds (attempt {retry_count}/{max_retries})...")
-                time.sleep(10)
+                # Network-related errors that should retry indefinitely
+                is_network_error = any(err_type in str(e) for err_type in [
+                    "NameResolutionError", 
+                    "ConnectionError", 
+                    "Temporary failure",
+                    "timeout",
+                    "ConnectTimeoutError",
+                    "ReadTimeoutError"
+                ])
+                
+                if is_network_error and infinite_network_retries:
+                    # Use exponential backoff for network errors
+                    wait_time = min(2 ** retry_count, max_wait_time)  # Cap at max_wait_time
+                    self.logger.error(f"Network error: {str(e)}")
+                    self.logger.info(f"Retrying after network error in {wait_time} seconds (attempt {retry_count+1})...")
+                    time.sleep(wait_time)
+                    retry_count += 1
+                    continue
+                else:
+                    # Non-network errors use standard retry logic
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        self.logger.error(f"Request error: {str(e)}")
+                        self.logger.info(f"Retrying in 10 seconds (attempt {retry_count}/{max_retries})...")
+                        time.sleep(10)
+                        continue
+            
+            # If we've exhausted retries for non-network errors
+            if retry_count >= max_retries:
+                self.logger.error(f"Failed after {retry_count} retries. Waiting 30 minutes before continuing...")
+                
+                # Sleep for 30 minutes
+                minutes_30 = 30 * 60
+                self.logger.info(f"Sleeping for 30 minutes!!")
+                time.sleep(minutes_30)
+                retry_count = 0  # Reset retry count after sleep
+            
+            # Try one more time after 30 minutes
+            self._respect_rate_limit()
+            if method.lower() == 'get':
+                return requests.get(url, **kwargs)
+            else:
+                return requests.post(url, **kwargs)
+    
+    def save_continuation_token(self, token, page_offset):
+        """Save continuation token and page offset to file for resumption capability."""
+        token_file = os.path.join(self.output_dir, "continuation_token.txt")
+        backup_file = os.path.join(self.output_dir, f"continuation_token.backup.{int(time.time())}.txt")
         
-        # If we've exhausted retries
-        self.logger.error(f"Failed after {max_retries} retries. Waiting 24 hours before continuing...")
-        
-        # Sleep for 30 minutes
-        minutes_30 = 30 * 60
-        self.logger.info(f"Sleeping for 30 minutes!!")
-        time.sleep(minutes_30)
-        
-        # Try one more time after 24 hours
-        self._respect_rate_limit()
-        if method.lower() == 'get':
-            return requests.get(url, **kwargs)
-        else:
-            return requests.post(url, **kwargs)
+        # Try to save to primary file
+        try:
+            with open(token_file, 'w') as f:
+                f.write(f"{token}\n{page_offset}")
+            return True
+        except IOError as e:
+            # If primary save fails, try backup
+            try:
+                with open(backup_file, 'w') as f:
+                    f.write(f"{token}\n{page_offset}")
+                return True
+            except IOError:
+                return False
     
     def bulk_search_papers(self, query=None, fields=None, sort=None, publication_types=None, 
                       open_access_pdf=False, min_citation_count=None, 
@@ -267,11 +334,10 @@ class SemanticScholarBulkSearch:
                 self.logger.info(f"Next continuation token: {continuation_token}, page offset: {current_page_offset}")
                 
                 # Save token and page offset to a file for resumption
-                token_file = os.path.join(self.output_dir, "continuation_token.txt")
-                with open(token_file, 'w') as f:
-                    f.write(f"{continuation_token}\n{current_page_offset}")
-                
-                self.logger.info(f"Saved continuation token and page offset to {token_file}")
+                if self.save_continuation_token(continuation_token, current_page_offset):
+                    self.logger.info(f"Saved continuation token and page offset to continuation_token.txt")
+                else:
+                    self.logger.warning("Failed to save continuation token")
             else:
                 self.logger.info("No more continuation tokens. Search is complete.")
             
@@ -330,8 +396,13 @@ class SemanticScholarBulkSearch:
             return backup_path
 
 def load_continuation_token(output_dir):
-    """Load continuation token and page offset from file if it exists."""
+    """
+    Load continuation token and page offset from file if it exists.
+    Also checks for backup token files if the main one fails.
+    """
     token_file = os.path.join(output_dir, "continuation_token.txt")
+    
+    # First try the main token file
     if os.path.exists(token_file):
         try:
             with open(token_file, 'r') as f:
@@ -339,9 +410,59 @@ def load_continuation_token(output_dir):
                 token = lines[0] if lines else None
                 page_offset = int(lines[1]) if len(lines) > 1 else 0
                 return token, page_offset
-        except IOError:
-            return None, 0
+        except (IOError, ValueError):
+            # If main file fails, look for backups
+            pass
+    
+    # If main file doesn't exist or had an error, try backup files
+    backup_files = [f for f in os.listdir(output_dir) 
+                   if f.startswith("continuation_token.backup") and f.endswith(".txt")]
+    
+    if backup_files:
+        # Sort by timestamp (newest first)
+        backup_files.sort(reverse=True)
+        
+        for backup in backup_files:
+            try:
+                with open(os.path.join(output_dir, backup), 'r') as f:
+                    lines = f.read().strip().split('\n')
+                    token = lines[0] if lines else None
+                    page_offset = int(lines[1]) if len(lines) > 1 else 0
+                    return token, page_offset
+            except (IOError, ValueError):
+                continue
+    
+    # If no valid token found
     return None, 0
+
+def auto_recovery(args):
+    """
+    Automatically recover from a failed or interrupted search by using the last saved token.
+    Returns updated arguments with resume information if a token is found.
+    """
+    if not os.path.exists(args.output_dir):
+        return args
+    
+    # Only auto-recover if not explicitly resuming already
+    if not args.resume:
+        token, page_offset = load_continuation_token(args.output_dir)
+        if token:
+            print(f"Found a continuation token from a previous run. Auto-recovering...")
+            print(f"Token: {token}")
+            print(f"Page offset: {page_offset}")
+            
+            # Ask for confirmation if in interactive mode
+            if not args.auto_recover:
+                response = input("Do you want to resume from this point? (y/n): ").lower()
+                if response != 'y':
+                    print("Not resuming. Starting a new search.")
+                    return args
+            
+            # Update args to enable resumption
+            args.resume = True
+            return args
+    
+    return args
 
 def main():
     parser = argparse.ArgumentParser(description="Search for papers using Semantic Scholar bulk search API")
@@ -361,7 +482,11 @@ def main():
     parser.add_argument("--output-dir", default="./search_results", help="Directory to save results")
     parser.add_argument("--log-file", default="search_logs.log", help="Log file name")
     parser.add_argument("--resume", action="store_true", help="Resume from last known point if available")
+    parser.add_argument("--auto-recover", action="store_true", help="Automatically recover from last saved token without asking")
     args = parser.parse_args()
+    
+    # Apply auto-recovery if enabled
+    args = auto_recovery(args)
     
     # Split comma-separated values into lists
     fields = args.fields.split(",") if args.fields else ["title", "abstract", "authors", "venue", "year", "citationCount", "fieldsOfStudy", "s2FieldsOfStudy", "publicationTypes", "externalIds", "openAccessPdf", "publicationDate", "url"]
