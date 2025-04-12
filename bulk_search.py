@@ -85,9 +85,7 @@ class SemanticScholarBulkSearch:
         Returns:
             requests.Response: The response object if successful
         """
-        max_retries = 10
         retry_count = 0
-        infinite_network_retries = True  # Set to True to keep retrying network errors indefinitely
         max_wait_time = 300  # Maximum wait time between retries (5 minutes)
         
         while True:
@@ -125,18 +123,17 @@ class SemanticScholarBulkSearch:
                     # Specific handling for rate limiting
                     if response.status_code == 429:
                         self.logger.warning("Rate limit exceeded. Waiting longer...")
-                        retry_count += 1
                         wait_time = 30  # Wait longer for rate limit errors
                     else:
-                        retry_count += 1
-                        wait_time = 10
+                        wait_time = min(10 * (retry_count + 1), max_wait_time)
                     
-                    self.logger.info(f"Retrying in {wait_time} seconds (attempt {retry_count}/{max_retries})...")
+                    self.logger.info(f"Retrying in {wait_time} seconds (attempt {retry_count+1})...")
                     time.sleep(wait_time)
+                    retry_count += 1
                     continue
             
             except requests.exceptions.RequestException as e:
-                # Network-related errors that should retry indefinitely
+                # Network-related errors - retry indefinitely with backoff
                 is_network_error = any(err_type in str(e) for err_type in [
                     "NameResolutionError", 
                     "ConnectionError", 
@@ -146,39 +143,21 @@ class SemanticScholarBulkSearch:
                     "ReadTimeoutError"
                 ])
                 
-                if is_network_error and infinite_network_retries:
-                    # Use exponential backoff for network errors
-                    wait_time = min(2 ** retry_count, max_wait_time)  # Cap at max_wait_time
-                    self.logger.error(f"Network error: {str(e)}")
-                    self.logger.info(f"Retrying after network error in {wait_time} seconds (attempt {retry_count+1})...")
-                    time.sleep(wait_time)
-                    retry_count += 1
-                    continue
-                else:
-                    # Non-network errors use standard retry logic
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        self.logger.error(f"Request error: {str(e)}")
-                        self.logger.info(f"Retrying in 10 seconds (attempt {retry_count}/{max_retries})...")
-                        time.sleep(10)
-                        continue
-            
-            # If we've exhausted retries for non-network errors
-            if retry_count >= max_retries:
-                self.logger.error(f"Failed after {retry_count} retries. Waiting 30 minutes before continuing...")
+                # Save current continuation token and page offset if available in kwargs
+                # This is done inside an exception so it's only saved on errors
+                if 'params' in kwargs and 'token' in kwargs['params']:
+                    token = kwargs['params']['token']
+                    page_offset = kwargs['params'].get('offset', 0)
+                    self.save_continuation_token(token, page_offset)
+                    self.logger.info(f"Saved continuation token during error for recovery")
                 
-                # Sleep for 30 minutes
-                minutes_30 = 30 * 60
-                self.logger.info(f"Sleeping for 30 minutes!!")
-                time.sleep(minutes_30)
-                retry_count = 0  # Reset retry count after sleep
-            
-            # Try one more time after 30 minutes
-            self._respect_rate_limit()
-            if method.lower() == 'get':
-                return requests.get(url, **kwargs)
-            else:
-                return requests.post(url, **kwargs)
+                # Use exponential backoff for network errors, cap at max_wait_time
+                wait_time = min(2 ** min(retry_count, 8), max_wait_time)
+                self.logger.error(f"Request error: {str(e)}")
+                self.logger.info(f"Retrying after error in {wait_time} seconds (attempt {retry_count+1})...")
+                time.sleep(wait_time)
+                retry_count += 1
+                continue
     
     def save_continuation_token(self, token, page_offset):
         """Save continuation token and page offset to file for resumption capability."""
@@ -231,7 +210,7 @@ class SemanticScholarBulkSearch:
         
         # Build query parameters
         # If no query is provided, use "*" as a wildcard to match everything
-        params = {"query": query if query else "*", "offset": page_offset}
+        params = {"query": query if query else "*"}
         
         if fields:
             params["fields"] = ",".join(fields)
@@ -270,80 +249,83 @@ class SemanticScholarBulkSearch:
         # Check if we're resuming and load existing data
         if resume_token and os.path.exists(output_path):
             try:
-                with open(output_path, 'r', encoding='utf-8') as f:
-                    all_papers = json.load(f)
-                    self.logger.info(f"Resuming search with {len(all_papers)} papers already collected at page offset {current_page_offset}")
-            except json.JSONDecodeError:
-                self.logger.warning(f"Could not load existing data from {output_path}. Starting fresh.")
-                all_papers = []
+                # Instead of reading the entire file, just check that it exists
+                self.logger.info(f"Resuming search from token with current page offset {current_page_offset}")
+            except Exception as e:
+                self.logger.warning(f"Error during resume operation: {str(e)}. Starting fresh.")
         
         # Keep fetching until we have all papers or reach the max_papers limit
         batch_count = 0
         while True:
             batch_count += 1
-            # Add continuation token if we have one
+            # Add continuation token if we have one, otherwise use page offset
             if continuation_token:
                 params["token"] = continuation_token
-                self.logger.info(f"Using continuation token: {continuation_token} with page offset: {current_page_offset}")
+                self.logger.info(f"Using continuation token: {continuation_token}")
             else:
                 params["offset"] = current_page_offset
                 self.logger.info(f"Using page offset: {current_page_offset}")
             
             self.logger.info(f"Fetching batch {batch_count} of papers...")
             
-            # Make the request with retry logic
-            response = self.make_request_with_retry('get', url, params=params, headers=self.headers)
-            
-            # Check for errors (this should rarely happen due to retry logic)
-            if response.status_code != 200:
-                self.logger.error(f"Error: {response.status_code} - {response.text}")
-                break
-            
-            # Parse response
-            result = response.json()
-            
-            # Initialize progress bar if this is the first request
-            if pbar is None:
-                total = min(result["total"], max_papers) if max_papers else result["total"]
-                pbar = tqdm(total=total, desc="Fetching papers")
-                self.logger.info(f"Found {result['total']} papers. Will fetch {'all' if not max_papers else max_papers}.")
-            
-            # Add papers to our results
-            papers = result["data"]
-            if len(papers) > 0:
-                all_papers.extend(papers)
-                papers_fetched = len(all_papers)
-                pbar.update(len(papers))
+            try:
+                # Make the request with retry logic
+                response = self.make_request_with_retry('get', url, params=params, headers=self.headers)
                 
-                self.logger.info(f"Fetched {len(papers)} papers in this batch. Total: {papers_fetched} papers")
+                # Parse response
+                result = response.json()
                 
-                # Increment page offset for next request
-                current_page_offset += len(papers)
+                # Initialize progress bar if this is the first request
+                if pbar is None:
+                    total = min(result["total"], max_papers) if max_papers else result["total"]
+                    pbar = tqdm(total=total, desc="Fetching papers")
+                    self.logger.info(f"Found {result['total']} papers. Will fetch {'all' if not max_papers else max_papers}.")
                 
-                # Incrementally save results after each batch
-                self.save_results(all_papers, output_file, append=False)
-                self.logger.info(f"Saved {papers_fetched} papers to {output_path}")
-            else:
-                self.logger.info("No papers in this batch. Might have reached the end of results.")
-            
-            # Check if we need to continue
-            continuation_token = result.get("token")
-            
-            # Log the continuation token and page offset for resumption capability
-            if continuation_token:
-                self.logger.info(f"Next continuation token: {continuation_token}, page offset: {current_page_offset}")
-                
-                # Save token and page offset to a file for resumption
-                if self.save_continuation_token(continuation_token, current_page_offset):
-                    self.logger.info(f"Saved continuation token and page offset to continuation_token.txt")
+                # Add papers to our results
+                papers = result["data"]
+                if len(papers) > 0:
+                    all_papers.extend(papers)
+                    papers_fetched = len(all_papers)
+                    pbar.update(len(papers))
+                    
+                    self.logger.info(f"Fetched {len(papers)} papers in this batch. Total: {papers_fetched} papers")
+                    
+                    # Increment page offset for next request
+                    current_page_offset += len(papers)
+                    
+                    # Incrementally save results after each batch
+                    self.save_results(all_papers, output_file, append=False)
+                    self.logger.info(f"Saved {papers_fetched} papers to {output_path}")
                 else:
-                    self.logger.warning("Failed to save continuation token")
-            else:
-                self.logger.info("No more continuation tokens. Search is complete.")
-            
-            # Stop if we've reached our limit or there are no more papers
-            if not continuation_token or (max_papers and papers_fetched >= max_papers):
-                break
+                    self.logger.info("No papers in this batch. Might have reached the end of results.")
+                
+                # Update continuation token for next request
+                continuation_token = result.get("token")
+                
+                # Log the continuation token for debugging
+                if continuation_token:
+                    self.logger.info(f"Next continuation token: {continuation_token}, page offset: {current_page_offset}")
+                else:
+                    self.logger.info("No more continuation tokens. Search is complete.")
+                
+                # Stop if we've reached our limit or there are no more papers
+                if not continuation_token or (max_papers and papers_fetched >= max_papers):
+                    break
+                
+            except Exception as e:
+                # Handle any unexpected errors gracefully
+                self.logger.error(f"Unexpected error during search: {str(e)}")
+                
+                # Save current state for recovery
+                if continuation_token:
+                    self.save_continuation_token(continuation_token, current_page_offset)
+                    self.logger.info(f"Saved state for recovery: token={continuation_token}, offset={current_page_offset}")
+                
+                # Wait and retry
+                wait_time = 30
+                self.logger.info(f"Will retry in {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
         
         if pbar:
             pbar.close()
@@ -399,18 +381,40 @@ def load_continuation_token(output_dir):
     """
     Load continuation token and page offset from file if it exists.
     Also checks for backup token files if the main one fails.
+    Reads only the last few lines of files for efficiency.
     """
     token_file = os.path.join(output_dir, "continuation_token.txt")
     
     # First try the main token file
     if os.path.exists(token_file):
         try:
+            # Read only the last few lines of the file
             with open(token_file, 'r') as f:
-                lines = f.read().strip().split('\n')
-                token = lines[0] if lines else None
-                page_offset = int(lines[1]) if len(lines) > 1 else 0
-                return token, page_offset
-        except (IOError, ValueError):
+                # Read the last 100 bytes or the entire file, whichever is smaller
+                file_size = os.path.getsize(token_file)
+                f.seek(max(0, file_size - 100))
+                
+                # Skip the first line if we're not at the beginning (it might be partial)
+                if file_size > 100:
+                    f.readline()
+                
+                # Read the rest of the file
+                data = f.read().strip()
+                
+                # Parse the token and page offset
+                lines = data.split('\n')
+                if len(lines) >= 2:
+                    token = lines[-2]  # Second-to-last line is the token
+                    page_offset = int(lines[-1])  # Last line is the page offset
+                    return token, page_offset
+                elif len(lines) == 1 and ':' in lines[0]:  # Handle old format where token and offset might be on same line
+                    parts = lines[0].split(':')
+                    if len(parts) >= 2:
+                        token = parts[0]
+                        page_offset = int(parts[1])
+                        return token, page_offset
+        except (IOError, ValueError) as e:
+            print(f"Error reading main token file: {str(e)}")
             # If main file fails, look for backups
             pass
     
@@ -425,11 +429,25 @@ def load_continuation_token(output_dir):
         for backup in backup_files:
             try:
                 with open(os.path.join(output_dir, backup), 'r') as f:
-                    lines = f.read().strip().split('\n')
-                    token = lines[0] if lines else None
-                    page_offset = int(lines[1]) if len(lines) > 1 else 0
-                    return token, page_offset
-            except (IOError, ValueError):
+                    # Read only the last few lines
+                    file_size = os.path.getsize(os.path.join(output_dir, backup))
+                    f.seek(max(0, file_size - 100))
+                    
+                    # Skip the first line if we're not at the beginning
+                    if file_size > 100:
+                        f.readline()
+                    
+                    # Read the rest of the file
+                    data = f.read().strip()
+                    
+                    # Parse the token and page offset
+                    lines = data.split('\n')
+                    if len(lines) >= 2:
+                        token = lines[-2]  # Second-to-last line is the token
+                        page_offset = int(lines[-1])  # Last line is the page offset
+                        return token, page_offset
+            except (IOError, ValueError) as e:
+                print(f"Error reading backup file {backup}: {str(e)}")
                 continue
     
     # If no valid token found
@@ -440,27 +458,22 @@ def auto_recovery(args):
     Automatically recover from a failed or interrupted search by using the last saved token.
     Returns updated arguments with resume information if a token is found.
     """
+    # Only attempt recovery if auto-recover flag is explicitly set
+    if not args.auto_recover:
+        return args
+    
     if not os.path.exists(args.output_dir):
         return args
     
-    # Only auto-recover if not explicitly resuming already
-    if not args.resume:
-        token, page_offset = load_continuation_token(args.output_dir)
-        if token:
-            print(f"Found a continuation token from a previous run. Auto-recovering...")
-            print(f"Token: {token}")
-            print(f"Page offset: {page_offset}")
-            
-            # Ask for confirmation if in interactive mode
-            if not args.auto_recover:
-                response = input("Do you want to resume from this point? (y/n): ").lower()
-                if response != 'y':
-                    print("Not resuming. Starting a new search.")
-                    return args
-            
-            # Update args to enable resumption
-            args.resume = True
-            return args
+    token, page_offset = load_continuation_token(args.output_dir)
+    if token:
+        print(f"Found a continuation token from a previous run. Auto-recovering...")
+        print(f"Token: {token}")
+        print(f"Page offset: {page_offset}")
+        
+        # Update args to enable resumption
+        args.resume = True
+        return args
     
     return args
 
@@ -481,8 +494,7 @@ def main():
     parser.add_argument("--api-key", help="API key for Semantic Scholar")
     parser.add_argument("--output-dir", default="./search_results", help="Directory to save results")
     parser.add_argument("--log-file", default="search_logs.log", help="Log file name")
-    parser.add_argument("--resume", action="store_true", help="Resume from last known point if available")
-    parser.add_argument("--auto-recover", action="store_true", help="Automatically recover from last saved token without asking")
+    parser.add_argument("--auto-recover", action="store_true", help="Automatically recover from last saved token if available")
     args = parser.parse_args()
     
     # Apply auto-recovery if enabled
@@ -501,7 +513,8 @@ def main():
     # Check if we should resume
     resume_token = None
     page_offset = 0
-    if args.resume:
+    # Only check for resume token if auto-recover is enabled
+    if hasattr(args, 'resume') and args.resume:
         resume_token, page_offset = load_continuation_token(args.output_dir)
         if resume_token:
             searcher.logger.info(f"Resuming search with token: {resume_token}, page offset: {page_offset}")
