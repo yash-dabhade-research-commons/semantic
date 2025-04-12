@@ -256,6 +256,10 @@ class SemanticScholarBulkSearch:
         
         # Keep fetching until we have all papers or reach the max_papers limit
         batch_count = 0
+        missing_token_retries = 0
+        max_missing_token_retries = 125  # Number of times to retry when token is missing
+        total_papers_expected = None
+        
         while True:
             batch_count += 1
             # Add continuation token if we have one, otherwise use page offset
@@ -277,7 +281,8 @@ class SemanticScholarBulkSearch:
                 
                 # Initialize progress bar if this is the first request
                 if pbar is None:
-                    total = min(result["total"], max_papers) if max_papers else result["total"]
+                    total_papers_expected = result["total"]
+                    total = min(total_papers_expected, max_papers) if max_papers else total_papers_expected
                     pbar = tqdm(total=total, desc="Fetching papers")
                     self.logger.info(f"Found {result['total']} papers. Will fetch {'all' if not max_papers else max_papers}.")
                 
@@ -296,8 +301,12 @@ class SemanticScholarBulkSearch:
                     # Incrementally save results after each batch
                     self.save_results(all_papers, output_file, append=False)
                     self.logger.info(f"Saved {papers_fetched} papers to {output_path}")
+                    
+                    # Reset missing token retries because we got valid data
+                    missing_token_retries = 0
                 else:
-                    self.logger.info("No papers in this batch. Might have reached the end of results.")
+                    self.logger.info("No papers in this batch. Might be a temporary issue.")
+                    missing_token_retries += 1
                 
                 # Update continuation token for next request
                 continuation_token = result.get("token")
@@ -305,11 +314,27 @@ class SemanticScholarBulkSearch:
                 # Log the continuation token for debugging
                 if continuation_token:
                     self.logger.info(f"Next continuation token: {continuation_token}, page offset: {current_page_offset}")
+                    # Reset missing token retries because we got a token
+                    missing_token_retries = 0
                 else:
-                    self.logger.info("No more continuation tokens. Search is complete.")
+                    self.logger.warning("No continuation token received.")
+                    missing_token_retries += 1
+                    
+                    # Check if we've got all expected papers
+                    if total_papers_expected and len(all_papers) >= total_papers_expected:
+                        self.logger.info(f"Fetched all {total_papers_expected} papers. Search is complete.")
+                        break
+                    
+                    # If we're missing tokens but haven't reached the expected total
+                    if missing_token_retries <= max_missing_token_retries:
+                        self.logger.info(f"Will retry using page offset (retry {missing_token_retries}/{max_missing_token_retries})")
+                        time.sleep(10)  # Wait before retrying
+                        continue
+                    else:
+                        self.logger.warning(f"Missing continuation token after {max_missing_token_retries} retries.")
                 
-                # Stop if we've reached our limit or there are no more papers
-                if not continuation_token or (max_papers and papers_fetched >= max_papers):
+                # Stop if we've reached our limit or exceeded max missing token retries
+                if (max_papers and papers_fetched >= max_papers) or (missing_token_retries > max_missing_token_retries and not continuation_token):
                     break
                 
             except Exception as e:
@@ -329,6 +354,20 @@ class SemanticScholarBulkSearch:
         
         if pbar:
             pbar.close()
+        
+        # Check if we got all the expected papers
+        if total_papers_expected and len(all_papers) < total_papers_expected:
+            completion_percentage = (len(all_papers) / total_papers_expected) * 100
+            self.logger.warning(f"Search ended at {completion_percentage:.2f}% completion. Got {len(all_papers)} out of {total_papers_expected} papers.")
+            
+            # Save the last state for possible manual recovery
+            if continuation_token:
+                self.save_continuation_token(continuation_token, current_page_offset)
+            else:
+                # If we don't have a token, save the current page offset
+                self.save_continuation_token("NO_TOKEN", current_page_offset)
+                
+            self.logger.info(f"Saved final state for manual recovery if needed.")
         
         # Trim results if we fetched more than max_papers
         if max_papers and len(all_papers) > max_papers:
