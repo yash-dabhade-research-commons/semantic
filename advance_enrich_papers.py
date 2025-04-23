@@ -785,5 +785,595 @@ class ProgressReporter:
         
         # Also print to console directly for visibility
         print(f"\n{report_text}")
+
+
+# --- Enrichment Coordinator ---
+class EnrichmentCoordinator:
+    """
+    Coordinates the entire enrichment process, including:
+    - Paper fetching from Elasticsearch
+    - Distributing enrichment tasks to worker threads
+    - Processing results and updating Elasticsearch
+    - Tracking progress and generating reports
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.stop_event = threading.Event()
+        self.update_queue = queue.Queue(maxsize=1000)  # Buffer for ES updates
         
-        # Email report functionality could be added here if needed
+        # Initialize components
+        self.es_client = ESClient(
+            config["elasticsearch"]["host"],
+            config["elasticsearch"]["port"],
+            config["elasticsearch"]["user"],
+            config["elasticsearch"]["password"],
+            timeout=config["elasticsearch"]["timeout"],
+            max_retries=config["elasticsearch"]["max_retries"]
+        )
+        
+        self.rate_limiter = AdaptiveRateLimiter(config["rate_limits"])
+        
+        # List of unpaywall emails - add your emails here
+        UNPAYWALL_EMAILS = [
+            "research.tool.user@gmail.com",
+            "academic.query@gmail.com",
+            "openaccess.finder@gmail.com",
+            "pdf.retriever@gmail.com",
+            "scholarly.api@gmail.com"
+        ]
+        
+        self.email_manager = EmailRotationManager(UNPAYWALL_EMAILS)
+        
+        self.state_manager = StateManager(config["state_file"])
+        
+        self.api_handler = APIRequestHandler(
+            self.rate_limiter,
+            self.email_manager,
+            config["retry"]
+        )
+        
+        # Initialize enrichers
+        self.enrichers = {
+            "semantic_scholar": SemanticScholarEnricher(self.api_handler),
+            "openalex": OpenAlexEnricher(self.api_handler, config["pyalex_email"]),
+            "unpaywall": UnpaywallEnricher(self.api_handler, self.email_manager)
+        }
+        
+        # Initialize reporter
+        self.reporter = ProgressReporter(
+            self.state_manager,
+            self.rate_limiter,
+            self.email_manager,
+            config["report_interval"]
+        )
+        
+        # Thread pool for API requests
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=config["processing"]["threads"],
+            thread_name_prefix="enricher"
+        )
+        
+        # Update worker thread
+        self.update_thread = None
+    
+    def enrich_paper(self, paper_doc):
+        """Process a single paper document for enrichment."""
+        paper_id = paper_doc["_id"]
+        source = paper_doc["_source"]
+        
+        # Skip if already processed
+        if not self.state_manager.should_process_paper(paper_id):
+            return None
+        
+        needs_update = False
+        update_doc = {}
+        
+        # Determine what's missing
+        missing_abstract = not source.get('abstract')
+        pdf_info = source.get('openAccessPdf', {})
+        missing_pdf_url = not isinstance(pdf_info, dict) or not pdf_info.get('url')
+        
+        # Extract identifiers
+        paper_id_s2 = source.get('paperId')
+        doi = source.get('externalIds', {}).get('DOI')
+        title = source.get('title')
+        
+        # 1. Try Semantic Scholar
+        if paper_id_s2 and (missing_abstract or missing_pdf_url):
+            try:
+                s2_data = self.enrichers["semantic_scholar"].enrich(source)
+                if s2_data:
+                    if missing_abstract and 'abstract' in s2_data:
+                        update_doc['abstract'] = s2_data['abstract']
+                        self.state_manager.record_progress(
+                            abstract_counts={"semantic_scholar": 1, "total": 1}
+                        )
+                        missing_abstract = False
+                        needs_update = True
+                    
+                    if missing_pdf_url and 'openAccessPdf' in s2_data:
+                        update_doc['openAccessPdf'] = s2_data['openAccessPdf']
+                        self.state_manager.record_progress(
+                            pdf_counts={"semantic_scholar": 1, "total": 1}
+                        )
+                        missing_pdf_url = False
+                        needs_update = True
+            except Exception as e:
+                logging.error(f"Error enriching from Semantic Scholar: {e}")
+                self.state_manager.record_progress(error_counts={"semantic_scholar": 1})
+        
+        # 2. Try OpenAlex if still missing data
+        if (missing_abstract or missing_pdf_url) and (doi or title):
+            try:
+                oa_data = self.enrichers["openalex"].enrich(source)
+                if oa_data:
+                    if missing_abstract and 'abstract' in oa_data:
+                        update_doc['abstract'] = oa_data['abstract']
+                        self.state_manager.record_progress(
+                            abstract_counts={"openalex": 1, "total": 1}
+                        )
+                        missing_abstract = False
+                        needs_update = True
+                    
+                    if missing_pdf_url and 'openAccessPdf' in oa_data:
+                        # Only update if S2 didn't already find one
+                        if 'openAccessPdf' not in update_doc:
+                            update_doc['openAccessPdf'] = oa_data['openAccessPdf']
+                            self.state_manager.record_progress(
+                                pdf_counts={"openalex": 1, "total": 1}
+                            )
+                            missing_pdf_url = False
+                            needs_update = True
+            except Exception as e:
+                logging.error(f"Error enriching from OpenAlex: {e}")
+                self.state_manager.record_progress(error_counts={"openalex": 1})
+        
+        # 3. Try Unpaywall if still missing PDF URL
+        if missing_pdf_url and doi:
+            try:
+                upw_data = self.enrichers["unpaywall"].enrich(source)
+                if upw_data and 'openAccessPdf' in upw_data:
+                    # Only update if not already found
+                    if 'openAccessPdf' not in update_doc:
+                        update_doc['openAccessPdf'] = upw_data['openAccessPdf']
+                        self.state_manager.record_progress(
+                            pdf_counts={"unpaywall": 1, "total": 1}
+                        )
+                        missing_pdf_url = False
+                        needs_update = True
+            except Exception as e:
+                logging.error(f"Error enriching from Unpaywall: {e}")
+                self.state_manager.record_progress(error_counts={"unpaywall": 1})
+        
+        # Add to update queue if changes were made
+        if needs_update and update_doc:
+            update_action = {
+                "_op_type": "update",
+                "_index": self._get_index_name(),
+                "_id": paper_id,
+                "doc": update_doc
+            }
+            
+            # Put in queue for bulk processing
+            self.update_queue.put(update_action)
+            self.state_manager.record_progress(paper_id=paper_id, processed_count=1)
+            return update_action
+        
+        # No updates needed, just record progress
+        self.state_manager.record_progress(paper_id=paper_id, processed_count=1)
+        return None
+    
+    def _get_index_name(self):
+        return self.config["elasticsearch"]["index"]
+    
+    def _update_worker(self):
+        """Background thread that processes queued updates in batches."""
+        batch_size = self.config["batch_sizes"]["update"]
+        batch = []
+        last_flush_time = time.time()
+        flush_interval = 30  # Flush every 30 seconds even if batch not full
+        
+        while not self.stop_event.is_set() or not self.update_queue.empty():
+            try:
+                # Try to get an item with timeout
+                try:
+                    action = self.update_queue.get(timeout=1.0)
+                    batch.append(action)
+                    self.update_queue.task_done()
+                except queue.Empty:
+                    # No items in queue, check if we should flush anyway
+                    if batch and time.time() - last_flush_time > flush_interval:
+                        pass  # Will flush below
+                    else:
+                        continue  # Try again
+                
+                # Process batch if full or time interval exceeded
+                if len(batch) >= batch_size or (batch and time.time() - last_flush_time > flush_interval):
+                    success_count, failed_count = self.es_client.bulk_update(
+                        self._get_index_name(), batch
+                    )
+                    
+                    self.state_manager.record_progress(
+                        updated_count=success_count,
+                        failed_count=failed_count
+                    )
+                    
+                    if failed_count > 0:
+                        self.state_manager.record_progress(error_counts={"es_update": failed_count})
+                    
+                    batch = []
+                    last_flush_time = time.time()
+            
+            except Exception as e:
+                logging.error(f"Error in update worker: {e}", exc_info=True)
+                # Don't lose the batch if possible
+                if batch:
+                    try:
+                        success_count, failed_count = self.es_client.bulk_update(
+                            self._get_index_name(), batch
+                        )
+                        self.state_manager.record_progress(
+                            updated_count=success_count,
+                            failed_count=failed_count
+                        )
+                    except Exception:
+                        # If that also fails, increment error count
+                        self.state_manager.record_progress(
+                            failed_count=len(batch),
+                            error_counts={"es_update": len(batch)}
+                        )
+                    batch = []
+                time.sleep(5)  # Brief pause after error
+        
+        # Flush any remaining items
+        if batch:
+            try:
+                success_count, failed_count = self.es_client.bulk_update(
+                    self._get_index_name(), batch
+                )
+                self.state_manager.record_progress(
+                    updated_count=success_count,
+                    failed_count=failed_count
+                )
+            except Exception as e:
+                logging.error(f"Error in final batch update: {e}")
+                self.state_manager.record_progress(
+                    failed_count=len(batch),
+                    error_counts={"es_update": len(batch)}
+                )
+    
+    def start(self):
+        """Start the enrichment process."""
+        # Set up signal handlers for graceful shutdown
+        self._setup_signal_handlers()
+        
+        # Start reporter
+        self.reporter.start()
+        
+        # Start update thread
+        self.update_thread = threading.Thread(
+            target=self._update_worker,
+            daemon=True,
+            name="es_updater"
+        )
+        self.update_thread.start()
+        
+        # Begin processing
+        self._run_enrichment()
+    
+    def stop(self):
+        """Stop the enrichment process gracefully."""
+        logging.info("Stopping enrichment process...")
+        self.stop_event.set()
+        
+        # Stop reporter
+        self.reporter.stop()
+        
+        # Wait for threads to finish
+        if self.update_thread and self.update_thread.is_alive():
+            logging.info("Waiting for update thread to complete...")
+            self.update_thread.join(timeout=60.0)
+        
+        # Wait for all updates to complete
+        logging.info("Waiting for update queue to empty...")
+        try:
+            self.update_queue.join(timeout=60.0)
+        except Exception:
+            logging.warning("Timed out waiting for update queue to empty")
+        
+        # Shutdown thread pool
+        logging.info("Shutting down thread pool...")
+        self.thread_pool.shutdown(wait=True, cancel_futures=False)
+        
+        # Save final state
+        self.state_manager.save_state()
+        
+        # Generate final report
+        self.reporter._generate_report()
+        
+        logging.info("Enrichment process stopped")
+    
+    def _setup_signal_handlers(self):
+        """Set up signal handlers for graceful shutdown."""
+        def signal_handler(sig, frame):
+            logging.info(f"Received signal {sig}, shutting down...")
+            self.stop()
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    
+    def _run_enrichment(self):
+        """Main enrichment loop."""
+        # Get configuration
+        index_name = self.config["elasticsearch"]["index"]
+        min_citation = self.config["processing"]["min_citation"]
+        max_citation = self.config["processing"]["max_citation"]
+        batch_size = self.config["batch_sizes"]["fetch"]
+        max_papers = self.config["processing"]["max_papers"]
+        
+        # Update state with citation range
+        self.state_manager.state.citation_range = {"min": min_citation, "max": max_citation}
+        
+        # Get papers from Elasticsearch
+        last_id = self.state_manager.state.last_processed_id
+        papers_generator = self.es_client.get_papers_to_enrich(
+            index_name, min_citation, max_citation, batch_size, last_id
+        )
+        
+        if not papers_generator:
+            logging.error("Failed to get papers from Elasticsearch")
+            return
+        
+        # Process papers in thread pool
+        future_to_paper = {}
+        papers_processed = 0
+        
+        try:
+            # Main processing loop
+            for doc in papers_generator:
+                if self.stop_event.is_set():
+                    logging.info("Stop event detected, halting paper processing")
+                    break
+                
+                if papers_processed >= max_papers:
+                    logging.info(f"Reached max papers limit ({max_papers})")
+                    break
+                
+                # Skip if already processed (double-check)
+                if not self.state_manager.should_process_paper(doc["_id"]):
+                    logging.debug(f"Skipping already processed paper {doc['_id']}")
+                    continue
+                
+                # Submit to thread pool
+                future = self.thread_pool.submit(self.enrich_paper, doc)
+                future_to_paper[future] = doc["_id"]
+                
+                # Process completed futures to avoid memory buildup
+                completed = [f for f in future_to_paper if f.done()]
+                for future in completed:
+                    paper_id = future_to_paper[future]
+                    try:
+                        # Just to catch any exceptions
+                        future.result()
+                    except Exception as e:
+                        logging.error(f"Error processing paper {paper_id}: {e}")
+                    del future_to_paper[future]
+                
+                papers_processed += 1
+                
+                # Periodically generate progress report
+                if papers_processed % 5000 == 0:
+                    self.reporter._generate_report()
+            
+            # Wait for remaining tasks
+            for future in concurrent.futures.as_completed(future_to_paper):
+                paper_id = future_to_paper[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"Error processing paper {paper_id}: {e}")
+        
+        except Exception as e:
+            logging.error(f"Error in enrichment process: {e}", exc_info=True)
+        
+        finally:
+            # Wait for tasks to complete before returning
+            logging.info("Waiting for remaining tasks to complete...")
+            for future in concurrent.futures.as_completed(list(future_to_paper.keys())):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+    
+    def run_daemon(self):
+        """Run in daemon mode, periodically processing papers."""
+        while not self.stop_event.is_set():
+            start_time = time.time()
+            
+            try:
+                logging.info("Starting enrichment cycle")
+                self._run_enrichment()
+                logging.info("Enrichment cycle completed")
+            except Exception as e:
+                logging.error(f"Error in enrichment cycle: {e}", exc_info=True)
+            
+            # Sleep until next cycle if daemon mode enabled
+            if self.config["enable_daemon"] and not self.stop_event.is_set():
+                sleep_time = self.config["daemon_sleep"]
+                elapsed = time.time() - start_time
+                
+                if elapsed < sleep_time:
+                    remaining = sleep_time - elapsed
+                    logging.info(f"Sleeping for {remaining:.1f} seconds until next cycle")
+                    
+                    # Wait for stop event or sleep time
+                    self.stop_event.wait(remaining)
+            else:
+                # Not in daemon mode, exit after one cycle
+                break
+
+# --- Main Execution Logic ---
+def main():
+    parser = argparse.ArgumentParser(description="Enrich Elasticsearch paper data with abstracts and PDF URLs.")
+    
+    # Configuration options
+    parser.add_argument("--config", help="Path to configuration file")
+    parser.add_argument("--create-config", action="store_true", help="Create a default configuration file")
+    
+    # Elasticsearch options
+    parser.add_argument("--host", help="Elasticsearch host")
+    parser.add_argument("--port", type=int, help="Elasticsearch port")
+    parser.add_argument("--user", help="Elasticsearch user")
+    parser.add_argument("--password", help="Elasticsearch password")
+    parser.add_argument("--index", help="Elasticsearch index name")
+    
+    # Processing options
+    parser.add_argument("--min-citation", type=int, help="Minimum citation count")
+    parser.add_argument("--max-citation", type=int, help="Maximum citation count")
+    parser.add_argument("--fetch-batch-size", type=int, help="Number of papers to fetch per batch")
+    parser.add_argument("--update-batch-size", type=int, help="Number of updates to send in bulk")
+    parser.add_argument("--max-papers", type=int, help="Maximum number of papers to process")
+    parser.add_argument("--threads", type=int, help="Number of concurrent worker threads")
+    
+    # Runtime options
+    parser.add_argument("--daemon", action="store_true", help="Run in daemon mode, processing periodically")
+    parser.add_argument("--daemon-sleep", type=int, help="Seconds to sleep between daemon runs")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--state-file", help="File to store process state")
+    parser.add_argument("--report-interval", type=int, help="Seconds between progress reports")
+    parser.add_argument("--resume", action="store_true", help="Resume from last processed paper")
+    
+    args = parser.parse_args()
+    
+    # Create default config if requested
+    if args.create_config:
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
+            print(f"Default configuration created at {CONFIG_FILE}")
+            print("Please edit this file with your settings and run again.")
+            return
+        except Exception as e:
+            print(f"Error creating config file: {e}")
+            return
+    
+    # Load configuration
+    config = DEFAULT_CONFIG.copy()
+    
+    # Load from config file if provided
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                file_config = yaml.safe_load(f)
+                # Deep update the configuration
+                for section, values in file_config.items():
+                    if section in config and isinstance(config[section], dict) and isinstance(values, dict):
+                        config[section].update(values)
+                    else:
+                        config[section] = values
+            print(f"Loaded configuration from {args.config}")
+        except Exception as e:
+            print(f"Error loading config file: {e}")
+            sys.exit(1)
+    
+    # Override config with command line arguments
+    if args.host:
+        config["elasticsearch"]["host"] = args.host
+    if args.port:
+        config["elasticsearch"]["port"] = args.port
+    if args.user:
+        config["elasticsearch"]["user"] = args.user
+    if args.password:
+        config["elasticsearch"]["password"] = args.password
+    if args.index:
+        config["elasticsearch"]["index"] = args.index
+    
+    if args.min_citation is not None:
+        config["processing"]["min_citation"] = args.min_citation
+    if args.max_citation is not None:
+        config["processing"]["max_citation"] = args.max_citation
+    if args.fetch_batch_size:
+        config["batch_sizes"]["fetch"] = args.fetch_batch_size
+    if args.update_batch_size:
+        config["batch_sizes"]["update"] = args.update_batch_size
+    if args.max_papers:
+        config["processing"]["max_papers"] = args.max_papers
+    if args.threads:
+        config["processing"]["threads"] = args.threads
+    
+    if args.daemon:
+        config["enable_daemon"] = True
+    if args.daemon_sleep:
+        config["daemon_sleep"] = args.daemon_sleep
+    if args.state_file:
+        config["state_file"] = args.state_file
+    if args.report_interval:
+        config["report_interval"] = args.report_interval
+    
+    # Set up logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logger = setup_logging(config["log_file"], log_level)
+    
+    # Log configuration
+    logger.info(f"Starting enrichment process with the following configuration:")
+    for section, values in config.items():
+        if isinstance(values, dict):
+            logger.info(f"{section}:")
+            for key, value in values.items():
+                # Don't log passwords
+                if 'password' in key.lower():
+                    logger.info(f"  {key}: ********")
+                else:
+                    logger.info(f"  {key}: {value}")
+        else:
+            logger.info(f"{section}: {values}")
+    
+    # Start the enrichment process
+    try:
+        coordinator = EnrichmentCoordinator(config)
+        
+        # Register cleanup on exit
+        def cleanup():
+            try:
+                coordinator.stop()
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
+        
+        atexit.register(cleanup)
+        
+        # Run either in daemon mode or one-time mode
+        if config["enable_daemon"]:
+            logger.info("Running in daemon mode")
+            coordinator.run_daemon()
+        else:
+            logger.info("Running in one-time mode")
+            coordinator.start()
+            coordinator.stop()
+        
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}", exc_info=True)
+    finally:
+        logger.info("Enrichment process completed")
+
+# --- Startup Script ---
+if __name__ == "__main__":
+    # Check Python version
+    if sys.version_info < (3, 7):
+        print("This script requires Python 3.7 or higher")
+        sys.exit(1)
+    
+    print("Starting paper enrichment script...")
+    
+    try:
+        print("Initializing main function")
+        main()
+        print("Main function completed")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
