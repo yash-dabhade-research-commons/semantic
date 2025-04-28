@@ -52,9 +52,9 @@ DEFAULT_CONFIG = {
         "max_retries": 3
     },
     "rate_limits": {
-        "semantic_scholar": 3,  # requests per second
-        "openalex": 10,
-        "unpaywall": 10
+        "semantic_scholar": 1,  # requests per second
+        "openalex": 2,
+        "unpaywall": 2
     },
     "batch_sizes": {
         "fetch": 100,  # docs per batch from ES
@@ -314,6 +314,11 @@ class StateManager:
         """Check if paper should be processed or skipped (already done)."""
         return paper_id not in self.state.already_processed_ids
     
+    def get_processed_count(self):
+        """Return the number of processed papers."""
+        with self.lock:
+            return len(self.state.already_processed_ids)
+    
     def get_stats(self):
         """Return current progress statistics."""
         with self.lock:
@@ -337,7 +342,8 @@ class StateManager:
                 "elapsed_time": elapsed,
                 "papers_per_second": papers_per_sec,
                 "update_success_rate": update_success_rate,
-                "last_paper_id": self.state.last_processed_id
+                "last_paper_id": self.state.last_processed_id,
+                "processed_ids_count": len(self.state.already_processed_ids)
             }
 
 # --- API Request Handler ---
@@ -435,8 +441,8 @@ class ESClient:
     def __init__(self, host, port, user, password, timeout=60, max_retries=3):
         self.connection_params = {
             "hosts": [f"http://{host}:{port}"],
-            "http_auth": (user, password),
-            "timeout": timeout,
+            "basic_auth": (user, password),  # Use basic_auth instead of http_auth
+            "request_timeout": timeout,  # Use request_timeout instead of timeout
             "max_retries": max_retries,
             "retry_on_timeout": True
         }
@@ -489,14 +495,13 @@ class ESClient:
                     ]
                 }
             },
-            "_source": ["paperId", "title", "externalIds", "abstract", "openAccessPdf"],
-            "sort": [{"_id": "asc"}]  # Sort by _id for reliable pagination
+            "_source": ["paperId", "title", "externalIds", "abstract", "openAccessPdf"]
         }
         
-        # Add search_after for resuming from last processed ID
+        # If resuming, add a filter to exclude already processed IDs
+        # instead of using sort and search_after which requires _id fielddata
         if last_id:
-            query["search_after"] = [last_id]
-            logging.info(f"Resuming scan from document ID: {last_id}")
+            logging.info(f"Resuming scan after document ID: {last_id}")
         
         logging.info(
             f"Fetching papers from index '{index_name}' with citation range "
@@ -509,8 +514,7 @@ class ESClient:
                 index=index_name,
                 query=query,
                 size=batch_size,
-                scroll='5m',
-                preserve_order=True  # Important for resuming correctly
+                scroll='5m'
             )
             return scan_generator
         except Exception as e:
@@ -1141,14 +1145,15 @@ class EnrichmentCoordinator:
                     logging.info(f"Reached max papers limit ({max_papers})")
                     break
                 
-                # Skip if already processed (double-check)
-                if not self.state_manager.should_process_paper(doc["_id"]):
-                    logging.debug(f"Skipping already processed paper {doc['_id']}")
+                # Skip if already processed
+                doc_id = doc["_id"]
+                if not self.state_manager.should_process_paper(doc_id):
+                    logging.debug(f"Skipping already processed paper {doc_id}")
                     continue
                 
                 # Submit to thread pool
                 future = self.thread_pool.submit(self.enrich_paper, doc)
-                future_to_paper[future] = doc["_id"]
+                future_to_paper[future] = doc_id
                 
                 # Process completed futures to avoid memory buildup
                 completed = [f for f in future_to_paper if f.done()]
