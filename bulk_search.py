@@ -32,12 +32,16 @@ class SemanticScholarBulkSearch:
         logger = logging.getLogger('semantic_scholar')
         logger.setLevel(logging.INFO)
         
+        # Clear existing handlers to prevent duplicate logs
+        if logger.handlers:
+            logger.handlers = []
+        
         # Create console handler
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
         
         # Create file handler
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_path)  # Use log_path with correct directory
         file_handler.setLevel(logging.INFO)
         
         # Create formatter
@@ -164,18 +168,24 @@ class SemanticScholarBulkSearch:
         token_file = os.path.join(self.output_dir, "continuation_token.txt")
         backup_file = os.path.join(self.output_dir, f"continuation_token.backup.{int(time.time())}.txt")
         
+        content = f"{token}\n{page_offset}"
+        
         # Try to save to primary file
         try:
             with open(token_file, 'w') as f:
-                f.write(f"{token}\n{page_offset}")
+                f.write(content)
+            self.logger.info(f"Saved continuation token: {token}, offset: {page_offset}")
             return True
         except IOError as e:
+            self.logger.error(f"Failed to save token to main file: {str(e)}")
             # If primary save fails, try backup
             try:
                 with open(backup_file, 'w') as f:
-                    f.write(f"{token}\n{page_offset}")
+                    f.write(content)
+                self.logger.info(f"Saved continuation token to backup file")
                 return True
-            except IOError:
+            except IOError as e:
+                self.logger.error(f"Failed to save token to backup file: {str(e)}")
                 return False
     
     def bulk_search_papers(self, query=None, fields=None, sort=None, publication_types=None, 
@@ -249,10 +259,12 @@ class SemanticScholarBulkSearch:
         # Check if we're resuming and load existing data
         if resume_token and os.path.exists(output_path):
             try:
-                # Instead of reading the entire file, just check that it exists
-                self.logger.info(f"Resuming search from token with current page offset {current_page_offset}")
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    all_papers = json.load(f)
+                self.logger.info(f"Resuming search from token with current page offset {current_page_offset}. Loaded {len(all_papers)} existing papers.")
             except Exception as e:
-                self.logger.warning(f"Error during resume operation: {str(e)}. Starting fresh.")
+                self.logger.warning(f"Error loading existing results: {str(e)}. Starting fresh.")
+                all_papers = []
         
         # Keep fetching until we have all papers or reach the max_papers limit
         batch_count = 0
@@ -263,10 +275,14 @@ class SemanticScholarBulkSearch:
         while True:
             batch_count += 1
             # Add continuation token if we have one, otherwise use page offset
-            if continuation_token:
+            if continuation_token and continuation_token != "NO_TOKEN":
                 params["token"] = continuation_token
+                if "offset" in params:
+                    del params["offset"]  # Remove offset parameter when using token
                 self.logger.info(f"Using continuation token: {continuation_token}")
             else:
+                if "token" in params:
+                    del params["token"]  # Remove token parameter when using offset
                 params["offset"] = current_page_offset
                 self.logger.info(f"Using page offset: {current_page_offset}")
             
@@ -279,15 +295,16 @@ class SemanticScholarBulkSearch:
                 # Parse response
                 result = response.json()
                 
-                # Initialize progress bar if this is the first request
+                # Initialize progress bar if this is the first request or we don't have one yet
                 if pbar is None:
-                    total_papers_expected = result["total"]
+                    total_papers_expected = result.get("total", 0)
                     total = min(total_papers_expected, max_papers) if max_papers else total_papers_expected
                     pbar = tqdm(total=total, desc="Fetching papers")
-                    self.logger.info(f"Found {result['total']} papers. Will fetch {'all' if not max_papers else max_papers}.")
+                    pbar.update(len(all_papers))  # Update with papers we've already processed
+                    self.logger.info(f"Found {total_papers_expected} papers. Will fetch {'all' if not max_papers else max_papers}.")
                 
                 # Add papers to our results
-                papers = result["data"]
+                papers = result.get("data", [])
                 if len(papers) > 0:
                     all_papers.extend(papers)
                     papers_fetched = len(all_papers)
@@ -310,6 +327,9 @@ class SemanticScholarBulkSearch:
                 
                 # Update continuation token for next request
                 continuation_token = result.get("token")
+                
+                # Always save the current state for potential recovery
+                self.save_continuation_token(continuation_token if continuation_token else "NO_TOKEN", current_page_offset)
                 
                 # Log the continuation token for debugging
                 if continuation_token:
@@ -342,9 +362,8 @@ class SemanticScholarBulkSearch:
                 self.logger.error(f"Unexpected error during search: {str(e)}")
                 
                 # Save current state for recovery
-                if continuation_token:
-                    self.save_continuation_token(continuation_token, current_page_offset)
-                    self.logger.info(f"Saved state for recovery: token={continuation_token}, offset={current_page_offset}")
+                self.save_continuation_token(continuation_token if continuation_token else "NO_TOKEN", current_page_offset)
+                self.logger.info(f"Saved state for recovery: token={continuation_token}, offset={current_page_offset}")
                 
                 # Wait and retry
                 wait_time = 30
@@ -419,43 +438,25 @@ class SemanticScholarBulkSearch:
 def load_continuation_token(output_dir):
     """
     Load continuation token and page offset from file if it exists.
-    Also checks for backup token files if the main one fails.
-    Reads only the last few lines of files for efficiency.
     """
     token_file = os.path.join(output_dir, "continuation_token.txt")
     
     # First try the main token file
     if os.path.exists(token_file):
         try:
-            # Read only the last few lines of the file
             with open(token_file, 'r') as f:
-                # Read the last 100 bytes or the entire file, whichever is smaller
-                file_size = os.path.getsize(token_file)
-                f.seek(max(0, file_size - 100))
-                
-                # Skip the first line if we're not at the beginning (it might be partial)
-                if file_size > 100:
-                    f.readline()
-                
-                # Read the rest of the file
-                data = f.read().strip()
-                
-                # Parse the token and page offset
-                lines = data.split('\n')
+                lines = f.read().strip().split('\n')
                 if len(lines) >= 2:
-                    token = lines[-2]  # Second-to-last line is the token
-                    page_offset = int(lines[-1])  # Last line is the page offset
+                    token = lines[0]  # First line is the token
+                    page_offset = int(lines[1])  # Second line is the page offset
+                    
+                    # Handle special case for NO_TOKEN
+                    if token == "NO_TOKEN":
+                        return None, page_offset
+                    
                     return token, page_offset
-                elif len(lines) == 1 and ':' in lines[0]:  # Handle old format where token and offset might be on same line
-                    parts = lines[0].split(':')
-                    if len(parts) >= 2:
-                        token = parts[0]
-                        page_offset = int(parts[1])
-                        return token, page_offset
         except (IOError, ValueError) as e:
             print(f"Error reading main token file: {str(e)}")
-            # If main file fails, look for backups
-            pass
     
     # If main file doesn't exist or had an error, try backup files
     backup_files = [f for f in os.listdir(output_dir) 
@@ -468,22 +469,15 @@ def load_continuation_token(output_dir):
         for backup in backup_files:
             try:
                 with open(os.path.join(output_dir, backup), 'r') as f:
-                    # Read only the last few lines
-                    file_size = os.path.getsize(os.path.join(output_dir, backup))
-                    f.seek(max(0, file_size - 100))
-                    
-                    # Skip the first line if we're not at the beginning
-                    if file_size > 100:
-                        f.readline()
-                    
-                    # Read the rest of the file
-                    data = f.read().strip()
-                    
-                    # Parse the token and page offset
-                    lines = data.split('\n')
+                    lines = f.read().strip().split('\n')
                     if len(lines) >= 2:
-                        token = lines[-2]  # Second-to-last line is the token
-                        page_offset = int(lines[-1])  # Last line is the page offset
+                        token = lines[0]  # First line is the token
+                        page_offset = int(lines[1])  # Second line is the page offset
+                        
+                        # Handle special case for NO_TOKEN
+                        if token == "NO_TOKEN":
+                            return None, page_offset
+                        
                         return token, page_offset
             except (IOError, ValueError) as e:
                 print(f"Error reading backup file {backup}: {str(e)}")
@@ -491,30 +485,6 @@ def load_continuation_token(output_dir):
     
     # If no valid token found
     return None, 0
-
-def auto_recovery(args):
-    """
-    Automatically recover from a failed or interrupted search by using the last saved token.
-    Returns updated arguments with resume information if a token is found.
-    """
-    # Only attempt recovery if auto-recover flag is explicitly set
-    if not args.auto_recover:
-        return args
-    
-    if not os.path.exists(args.output_dir):
-        return args
-    
-    token, page_offset = load_continuation_token(args.output_dir)
-    if token:
-        print(f"Found a continuation token from a previous run. Auto-recovering...")
-        print(f"Token: {token}")
-        print(f"Page offset: {page_offset}")
-        
-        # Update args to enable resumption
-        args.resume = True
-        return args
-    
-    return args
 
 def main():
     parser = argparse.ArgumentParser(description="Search for papers using Semantic Scholar bulk search API")
@@ -534,10 +504,23 @@ def main():
     parser.add_argument("--output-dir", default="./search_results", help="Directory to save results")
     parser.add_argument("--log-file", default="search_logs.log", help="Log file name")
     parser.add_argument("--auto-recover", action="store_true", help="Automatically recover from last saved token if available")
+    parser.add_argument("--resume", action="store_true", help="Resume from last saved token (explicit flag)")
     args = parser.parse_args()
     
-    # Apply auto-recovery if enabled
-    args = auto_recovery(args)
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Set up resume information
+    resume_token = None
+    page_offset = 0
+    
+    # Check for existing tokens if auto-recover or resume is enabled
+    if args.auto_recover or args.resume:
+        resume_token, page_offset = load_continuation_token(args.output_dir)
+        if resume_token or page_offset > 0:
+            print(f"Resuming search with {'token: ' + resume_token if resume_token else 'page offset: ' + str(page_offset)}")
+        else:
+            print("No continuation data found. Starting a new search.")
     
     # Split comma-separated values into lists
     fields = args.fields.split(",") if args.fields else ["title", "abstract", "authors", "venue", "year", "citationCount", "fieldsOfStudy", "s2FieldsOfStudy", "publicationTypes", "externalIds", "openAccessPdf", "publicationDate", "url"]
@@ -549,16 +532,10 @@ def main():
     searcher = SemanticScholarBulkSearch(api_key=args.api_key, output_dir=args.output_dir, log_file=args.log_file)
     searcher.logger.info("Starting Semantic Scholar Bulk Search")
     
-    # Check if we should resume
-    resume_token = None
-    page_offset = 0
-    # Only check for resume token if auto-recover is enabled
-    if hasattr(args, 'resume') and args.resume:
-        resume_token, page_offset = load_continuation_token(args.output_dir)
-        if resume_token:
-            searcher.logger.info(f"Resuming search with token: {resume_token}, page offset: {page_offset}")
-        else:
-            searcher.logger.info("No continuation token found. Starting a new search.")
+    if resume_token or page_offset > 0:
+        searcher.logger.info(f"Resuming search with {'token: ' + resume_token if resume_token else 'page offset: ' + str(page_offset)}")
+    else:
+        searcher.logger.info("Starting a new search.")
     
     # Search for papers
     papers = searcher.bulk_search_papers(
